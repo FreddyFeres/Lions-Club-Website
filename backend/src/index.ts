@@ -63,10 +63,24 @@ app.use('/api/applications', applicationRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
-// ── 404 Handler ───────────────────────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` });
-});
+// ── Serve Frontend (production) ─────────────────────────────────────────────
+const frontendDist = path.resolve(__dirname, '../../frontend/dist');
+if (fs.existsSync(frontendDist)) {
+  app.use(express.static(frontendDist));
+  // SPA fallback: serve index.html for all non-API routes
+  app.get('*', (req, res) => {
+    if (req.path.startsWith('/api')) {
+      res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` });
+    } else {
+      res.sendFile(path.join(frontendDist, 'index.html'));
+    }
+  });
+} else {
+  // Dev mode: no frontend dist
+  app.use((req, res) => {
+    res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` });
+  });
+}
 
 // ── Global Error Handler ──────────────────────────────────────────────────────
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
