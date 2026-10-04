@@ -75,7 +75,7 @@ export default function Home() {
         <video
           ref={videoRef}
           className="absolute inset-0 w-full h-full object-cover scale-105"
-          src="/club-cover.mp4"
+          src="/axes/Club-Cover.mp4"
           autoPlay
           muted
           loop
