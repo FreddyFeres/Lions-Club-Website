@@ -27,11 +27,16 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 
 // ── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: [
-    process.env.CLIENT_URL || 'http://localhost:3000',
-    'http://localhost:3000',
-    'http://localhost:5173',
-  ],
+  origin: (origin, callback) => {
+    const allowed = [
+      process.env.CLIENT_URL,
+      'http://localhost:3000',
+      'http://localhost:5173',
+    ].filter(Boolean);
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin || allowed.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS blocked: ${origin}`));
+  },
   credentials: true,
 }));
 
