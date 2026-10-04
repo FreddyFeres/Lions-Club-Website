@@ -1,0 +1,12 @@
+{
+  "name": "lions-club-website",
+  "version": "1.0.0",
+  "description": "Lions Club Website - Railway deployment entry point",
+  "scripts": {
+    "build": "cd backend && npm install && npm run build && npx prisma generate",
+    "start": "cd backend && node dist/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
