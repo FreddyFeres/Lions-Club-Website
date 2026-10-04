@@ -1,0 +1,197 @@
+// This is your Prisma schema file
+// Learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String    @id @default(uuid())
+  email            String    @unique
+  password         String
+  firstName        String
+  lastName         String
+  phone            String?
+  avatar           String?
+  role             String    @default("normal_user") // admin | board_member | club_member | normal_user
+  membershipNumber String?   @unique
+  duesPaidUntil    DateTime?
+  isActive         Boolean   @default(true)
+  bio              String?
+  address          String?
+  occupation       String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  refreshTokens    RefreshToken[]
+  eventBookings    EventBooking[]
+  meetingRsvps     MeetingAttendance[]
+  serviceHours     ServiceHour[]
+  documents        Document[]
+  transactions     Transaction[]
+  notifications    Notification[]
+  application      Application?
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Event {
+  id          String   @id @default(uuid())
+  title       String
+  slug        String   @unique
+  description String
+  location    String
+  startDate   DateTime
+  endDate     DateTime?
+  image       String?
+  category    String   @default("general")
+  capacity    Int?
+  isPublished Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  bookings    EventBooking[]
+}
+
+model EventBooking {
+  id        String   @id @default(uuid())
+  userId    String
+  eventId   String
+  status    String   @default("confirmed") // confirmed | cancelled | checked_in
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, eventId])
+}
+
+model Meeting {
+  id          String   @id @default(uuid())
+  title       String
+  description String?
+  location    String
+  date        DateTime
+  agenda      String?
+  pvFile      String?
+  isPublished Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  attendance  MeetingAttendance[]
+}
+
+model MeetingAttendance {
+  id         String   @id @default(uuid())
+  meetingId  String
+  userId     String
+  rsvpStatus String   @default("pending") // yes | no | maybe | pending
+  status     String?  // present | absent | excused
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  meeting Meeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([meetingId, userId])
+}
+
+model Transaction {
+  id          String   @id @default(uuid())
+  type        String   // income | expense
+  category    String
+  amount      Float
+  description String
+  date        DateTime
+  receipt     String?
+  userId      String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+model Donation {
+  id        String   @id @default(uuid())
+  name      String?
+  email     String?
+  amount    Float
+  message   String?
+  anonymous Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+model Document {
+  id         String   @id @default(uuid())
+  title      String
+  category   String   @default("general")
+  fileUrl    String
+  fileName   String
+  fileSize   Int?
+  mimeType   String?
+  uploadedBy String
+  isPublic   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [uploadedBy], references: [id], onDelete: Cascade)
+}
+
+model ServiceHour {
+  id          String   @id @default(uuid())
+  userId      String
+  activity    String
+  description String?
+  hours       Float
+  date        DateTime
+  status      String   @default("pending") // pending | approved | rejected
+  rejectReason String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Application {
+  id                     String   @id @default(uuid())
+  userId                 String   @unique
+  birthDate              String
+  statusType             String
+  fieldOfStudy           String
+  hasPastExperience      Boolean  @default(false)
+  pastExperienceDetails  String?
+  skills                 String
+  motivation             String
+  discoveryChannel       String   // JSON array stored as string
+  availability           String   // JSON array stored as string
+  readyForResponsibility Boolean  @default(false)
+  status                 String   @default("pending") // pending | interviewed | approved | rejected
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  title     String
+  message   String
+  type      String   @default("info") // info | success | warning | error
+  isRead    Boolean  @default(false)
+  link      String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
