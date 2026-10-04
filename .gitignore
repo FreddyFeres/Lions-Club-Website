@@ -46,6 +46,8 @@ backend/uploads/*
 *.mov
 *.avi
 *.mkv
+# Exception: small replacement billboard video (33MB - under GitHub limit)
+!frontend/public/axes/Club-Cover.mp4
 
 # TypeScript build info
 *.tsbuildinfo
