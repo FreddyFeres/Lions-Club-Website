@@ -28,13 +28,25 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 // ── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors({
   origin: (origin, callback) => {
+    // No origin = same-origin request, mobile app, or curl — always allow
+    if (!origin) return callback(null, true);
+
+    // Allow Railway app domains (*.railway.app) and localhost
     const allowed = [
       process.env.CLIENT_URL,
       'http://localhost:3000',
       'http://localhost:5173',
-    ].filter(Boolean);
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin || allowed.includes(origin)) return callback(null, true);
+      'http://localhost:4000',
+    ].filter(Boolean) as string[];
+
+    if (
+      allowed.includes(origin) ||
+      /^https?:\/\/.*\.railway\.app$/.test(origin) ||
+      /^https?:\/\/.*\.up\.railway\.app$/.test(origin)
+    ) {
+      return callback(null, true);
+    }
+
     callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
