@@ -64,15 +64,25 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
 // ── Serve Frontend (production) ─────────────────────────────────────────────
-const frontendDist = path.resolve(__dirname, '../../frontend/dist');
-if (fs.existsSync(frontendDist)) {
-  app.use(express.static(frontendDist));
+// __dirname in compiled JS = /app/backend/dist
+// frontend/dist = /app/frontend/dist  → go up 3 levels from __dirname
+const frontendDist = path.resolve(__dirname, '../../../frontend/dist');
+const frontendDistAlt = path.resolve(__dirname, '../../frontend/dist');
+const resolvedFrontend = fs.existsSync(frontendDist) ? frontendDist
+  : fs.existsSync(frontendDistAlt) ? frontendDistAlt
+  : null;
+
+console.log(`📦 Frontend dist lookup: ${frontendDist}`);
+console.log(`📦 Frontend dist exists: ${resolvedFrontend ? resolvedFrontend : 'NOT FOUND'}`);
+
+if (resolvedFrontend) {
+  app.use(express.static(resolvedFrontend));
   // SPA fallback: serve index.html for all non-API routes
   app.get('*', (req, res) => {
     if (req.path.startsWith('/api')) {
       res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` });
     } else {
-      res.sendFile(path.join(frontendDist, 'index.html'));
+      res.sendFile(path.join(resolvedFrontend, 'index.html'));
     }
   });
 } else {
@@ -81,6 +91,7 @@ if (fs.existsSync(frontendDist)) {
     res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` });
   });
 }
+
 
 // ── Global Error Handler ──────────────────────────────────────────────────────
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
