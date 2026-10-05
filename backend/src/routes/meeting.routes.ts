@@ -1,7 +1,10 @@
 import { Router, Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
-import prisma from '../prisma';
+import { eq, gte, and, sql } from 'drizzle-orm';
+import { v4 as uuid } from 'uuid';
+import db from '../db';
+import { meetings, meetingAttendance, users } from '../db/schema';
 import { authenticate, requireBoard, requireMember, AuthRequest } from '../middleware/auth';
 import { upload } from '../middleware/upload';
 
@@ -11,29 +14,50 @@ const router = Router();
 router.get('/', authenticate, requireMember, async (req: AuthRequest, res: Response) => {
   try {
     const { page = '1', limit = '12', upcoming } = req.query as any;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const where: any = { isPublished: true };
-    if (upcoming === 'true') where.date = { gte: new Date() };
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
 
-    const [meetings, total] = await Promise.all([
-      prisma.meeting.findMany({
-        where,
-        skip,
-        take: parseInt(limit),
-        orderBy: { date: 'desc' },
-        include: {
-          _count: { select: { attendance: true } },
-          attendance: {
-            where: { userId: req.user!.id },
-            select: { rsvpStatus: true, status: true },
-          },
-        },
-      }),
-      prisma.meeting.count({ where }),
+    const conditions: any[] = [eq(meetings.isPublished, true)];
+    if (upcoming === 'true') conditions.push(gte(meetings.date, new Date()));
+    const where = and(...conditions);
+
+    const [rows, countResult] = await Promise.all([
+      db.select().from(meetings).where(where).orderBy(sql`${meetings.date} desc`).limit(limitNum).offset(offset),
+      db.select({ count: sql<number>`count(*)` }).from(meetings).where(where),
     ]);
 
-    return res.json({ data: meetings, total, page: parseInt(page), limit: parseInt(limit) });
+    // Attach attendance count and current user's RSVP
+    const meetingIds = rows.map((m) => m.id);
+    const userId = req.user!.id;
+
+    const [attendanceCounts, userRsvps] = await Promise.all([
+      meetingIds.length
+        ? db.select({ meetingId: meetingAttendance.meetingId, count: sql<number>`count(*)` })
+            .from(meetingAttendance).where(and(...meetingIds.map(id => eq(meetingAttendance.meetingId, id)) as any))
+            .groupBy(meetingAttendance.meetingId)
+        : [],
+      meetingIds.length
+        ? db.select({ meetingId: meetingAttendance.meetingId, rsvpStatus: meetingAttendance.rsvpStatus, status: meetingAttendance.status })
+            .from(meetingAttendance)
+            .where(and(eq(meetingAttendance.userId, userId), sql`${meetingAttendance.meetingId} = ANY(${sql`ARRAY[${sql.join(meetingIds.map(id => sql`${id}`), sql`, `)}]::text[]`})`))
+        : [],
+    ]);
+
+    const countMap: Record<string, number> = {};
+    attendanceCounts.forEach((a: any) => { countMap[a.meetingId] = Number(a.count); });
+    const rsvpMap: Record<string, any> = {};
+    userRsvps.forEach((r: any) => { rsvpMap[r.meetingId] = { rsvpStatus: r.rsvpStatus, status: r.status }; });
+
+    const data = rows.map((m) => ({
+      ...m,
+      _count: { attendance: countMap[m.id] || 0 },
+      attendance: rsvpMap[m.id] ? [rsvpMap[m.id]] : [],
+    }));
+
+    return res.json({ data, total: Number(countResult[0].count), page: pageNum, limit: limitNum });
   } catch (e) {
+    console.error(e);
     return res.status(500).json({ message: 'Server error' });
   }
 });
@@ -41,11 +65,14 @@ router.get('/', authenticate, requireMember, async (req: AuthRequest, res: Respo
 // GET /meetings/my/rsvps — User's RSVPs
 router.get('/my/rsvps', authenticate, async (req: AuthRequest, res: Response) => {
   try {
-    const rsvps = await prisma.meetingAttendance.findMany({
-      where: { userId: req.user!.id },
-      include: { meeting: true },
-      orderBy: { createdAt: 'desc' },
-    });
+    const rsvps = await db.select({
+      id: meetingAttendance.id, rsvpStatus: meetingAttendance.rsvpStatus,
+      status: meetingAttendance.status, createdAt: meetingAttendance.createdAt,
+      meeting: meetings,
+    }).from(meetingAttendance)
+      .leftJoin(meetings, eq(meetingAttendance.meetingId, meetings.id))
+      .where(eq(meetingAttendance.userId, req.user!.id))
+      .orderBy(sql`${meetingAttendance.createdAt} desc`);
     return res.json(rsvps);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -55,18 +82,17 @@ router.get('/my/rsvps', authenticate, async (req: AuthRequest, res: Response) =>
 // GET /meetings/:id — Get meeting
 router.get('/:id', authenticate, requireMember, async (req: AuthRequest, res: Response) => {
   try {
-    const meeting = await prisma.meeting.findUnique({
-      where: { id: req.params.id },
-      include: {
-        attendance: {
-          where: { userId: req.user!.id },
-          select: { rsvpStatus: true, status: true },
-        },
-        _count: { select: { attendance: true } },
-      },
-    });
+    const [meeting] = await db.select().from(meetings).where(eq(meetings.id, req.params.id));
     if (!meeting) return res.status(404).json({ message: 'Meeting not found' });
-    return res.json(meeting);
+
+    const [[{ count }], userRsvp] = await Promise.all([
+      db.select({ count: sql<number>`count(*)` }).from(meetingAttendance).where(eq(meetingAttendance.meetingId, req.params.id)),
+      db.select({ rsvpStatus: meetingAttendance.rsvpStatus, status: meetingAttendance.status })
+        .from(meetingAttendance)
+        .where(and(eq(meetingAttendance.meetingId, req.params.id), eq(meetingAttendance.userId, req.user!.id))),
+    ]);
+
+    return res.json({ ...meeting, _count: { attendance: Number(count) }, attendance: userRsvp });
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
   }
@@ -76,19 +102,15 @@ router.get('/:id', authenticate, requireMember, async (req: AuthRequest, res: Re
 router.post('/', authenticate, requireBoard, upload.single('pvFile'), async (req: AuthRequest, res: Response) => {
   try {
     const { title, description, location, date, agenda } = req.body;
-    if (!title || !location || !date) {
-      return res.status(400).json({ message: 'Missing required fields' });
-    }
-    const meeting = await prisma.meeting.create({
-      data: {
-        title,
-        description: description || null,
-        location,
-        date: new Date(date),
-        agenda: agenda || null,
-        pvFile: req.file ? `meetings/${req.file.filename}` : null,
-      },
-    });
+    if (!title || !location || !date) return res.status(400).json({ message: 'Missing required fields' });
+
+    const [meeting] = await db.insert(meetings).values({
+      id: uuid(), title,
+      description: description || null,
+      location, date: new Date(date),
+      agenda: agenda || null,
+      pvFile: req.file ? `meetings/${req.file.filename}` : null,
+    }).returning();
     return res.status(201).json(meeting);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -99,7 +121,7 @@ router.post('/', authenticate, requireBoard, upload.single('pvFile'), async (req
 router.put('/:id', authenticate, requireBoard, upload.single('pvFile'), async (req: AuthRequest, res: Response) => {
   try {
     const { title, description, location, date, agenda, isPublished } = req.body;
-    const existing = await prisma.meeting.findUnique({ where: { id: req.params.id } });
+    const [existing] = await db.select().from(meetings).where(eq(meetings.id, req.params.id));
     if (!existing) return res.status(404).json({ message: 'Meeting not found' });
 
     if (req.file && existing.pvFile) {
@@ -107,18 +129,16 @@ router.put('/:id', authenticate, requireBoard, upload.single('pvFile'), async (r
       if (fs.existsSync(old)) fs.unlinkSync(old);
     }
 
-    const meeting = await prisma.meeting.update({
-      where: { id: req.params.id },
-      data: {
-        ...(title && { title }),
-        ...(description !== undefined && { description }),
-        ...(location && { location }),
-        ...(date && { date: new Date(date) }),
-        ...(agenda !== undefined && { agenda }),
-        ...(isPublished !== undefined && { isPublished: isPublished === 'true' || isPublished === true }),
-        ...(req.file && { pvFile: `meetings/${req.file.filename}` }),
-      },
-    });
+    const [meeting] = await db.update(meetings).set({
+      ...(title && { title }),
+      ...(description !== undefined && { description }),
+      ...(location && { location }),
+      ...(date && { date: new Date(date) }),
+      ...(agenda !== undefined && { agenda }),
+      ...(isPublished !== undefined && { isPublished: isPublished === 'true' || isPublished === true }),
+      ...(req.file && { pvFile: `meetings/${req.file.filename}` }),
+      updatedAt: new Date(),
+    }).where(eq(meetings.id, req.params.id)).returning();
     return res.json(meeting);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -128,13 +148,14 @@ router.put('/:id', authenticate, requireBoard, upload.single('pvFile'), async (r
 // DELETE /meetings/:id — Admin: delete meeting
 router.delete('/:id', authenticate, requireBoard, async (req: AuthRequest, res: Response) => {
   try {
-    const meeting = await prisma.meeting.findUnique({ where: { id: req.params.id } });
+    const [meeting] = await db.select().from(meetings).where(eq(meetings.id, req.params.id));
     if (!meeting) return res.status(404).json({ message: 'Meeting not found' });
     if (meeting.pvFile) {
       const fp = path.join(process.env.UPLOAD_DIR || 'uploads', meeting.pvFile);
       if (fs.existsSync(fp)) fs.unlinkSync(fp);
     }
-    await prisma.meeting.delete({ where: { id: req.params.id } });
+    await db.delete(meetingAttendance).where(eq(meetingAttendance.meetingId, req.params.id));
+    await db.delete(meetings).where(eq(meetings.id, req.params.id));
     return res.json({ message: 'Meeting deleted' });
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -148,11 +169,18 @@ router.post('/:id/rsvp', authenticate, requireMember, async (req: AuthRequest, r
     if (!['yes', 'no', 'maybe'].includes(rsvpStatus)) {
       return res.status(400).json({ message: 'Invalid RSVP status' });
     }
-    const attendance = await prisma.meetingAttendance.upsert({
-      where: { meetingId_userId: { meetingId: req.params.id, userId: req.user!.id } },
-      update: { rsvpStatus },
-      create: { meetingId: req.params.id, userId: req.user!.id, rsvpStatus },
-    });
+    const [existing] = await db.select().from(meetingAttendance)
+      .where(and(eq(meetingAttendance.meetingId, req.params.id), eq(meetingAttendance.userId, req.user!.id)));
+
+    let attendance;
+    if (existing) {
+      [attendance] = await db.update(meetingAttendance).set({ rsvpStatus, updatedAt: new Date() })
+        .where(eq(meetingAttendance.id, existing.id)).returning();
+    } else {
+      [attendance] = await db.insert(meetingAttendance).values({
+        id: uuid(), meetingId: req.params.id, userId: req.user!.id, rsvpStatus,
+      }).returning();
+    }
     return res.json(attendance);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -162,15 +190,17 @@ router.post('/:id/rsvp', authenticate, requireMember, async (req: AuthRequest, r
 // GET /meetings/:id/attendance — Admin: attendance list
 router.get('/:id/attendance', authenticate, requireBoard, async (req: AuthRequest, res: Response) => {
   try {
-    const attendance = await prisma.meetingAttendance.findMany({
-      where: { meetingId: req.params.id },
-      include: {
-        user: {
-          select: { id: true, firstName: true, lastName: true, email: true, membershipNumber: true, avatar: true },
-        },
+    const attendance = await db.select({
+      id: meetingAttendance.id, rsvpStatus: meetingAttendance.rsvpStatus,
+      status: meetingAttendance.status, createdAt: meetingAttendance.createdAt,
+      user: {
+        id: users.id, firstName: users.firstName, lastName: users.lastName,
+        email: users.email, membershipNumber: users.membershipNumber, avatar: users.avatar,
       },
-      orderBy: [{ rsvpStatus: 'asc' }, { createdAt: 'asc' }],
-    });
+    }).from(meetingAttendance)
+      .leftJoin(users, eq(meetingAttendance.userId, users.id))
+      .where(eq(meetingAttendance.meetingId, req.params.id))
+      .orderBy(meetingAttendance.rsvpStatus, meetingAttendance.createdAt);
     return res.json(attendance);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -184,10 +214,8 @@ router.patch('/:meetingId/attendance/:attendanceId/checkin', authenticate, requi
     if (!['present', 'absent', 'excused'].includes(status)) {
       return res.status(400).json({ message: 'Invalid status' });
     }
-    const attendance = await prisma.meetingAttendance.update({
-      where: { id: req.params.attendanceId },
-      data: { status },
-    });
+    const [attendance] = await db.update(meetingAttendance).set({ status, updatedAt: new Date() })
+      .where(eq(meetingAttendance.id, req.params.attendanceId)).returning();
     return res.json(attendance);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });

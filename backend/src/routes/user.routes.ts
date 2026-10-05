@@ -2,79 +2,75 @@ import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
-import prisma from '../prisma';
+import { eq, ilike, or, isNotNull, and, inArray, sql } from 'drizzle-orm';
+import { v4 as uuid } from 'uuid';
+import db from '../db';
+import { users, notifications } from '../db/schema';
 import { authenticate, requireAdmin, requireBoard, requireMember, AuthRequest } from '../middleware/auth';
 import { upload } from '../middleware/upload';
 
 const router = Router();
 
+const safeUserSelect = {
+  id: users.id, email: users.email, firstName: users.firstName, lastName: users.lastName,
+  role: users.role, avatar: users.avatar, membershipNumber: users.membershipNumber,
+  phone: users.phone, isActive: users.isActive, duesPaidUntil: users.duesPaidUntil,
+  occupation: users.occupation, createdAt: users.createdAt,
+};
+
 // GET /users — Admin: all users
 router.get('/', authenticate, requireBoard, async (req: AuthRequest, res: Response) => {
   try {
     const { search, role, page = '1', limit = '20' } = req.query as any;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const where: any = {};
-    if (search) {
-      where.OR = [
-        { firstName: { contains: search } },
-        { lastName: { contains: search } },
-        { email: { contains: search } },
-        { membershipNumber: { contains: search } },
-      ];
-    }
-    if (role) where.role = role;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
 
-    const [users, total] = await Promise.all([
-      prisma.user.findMany({
-        where,
-        skip,
-        take: parseInt(limit),
-        orderBy: { createdAt: 'desc' },
-        select: {
-          id: true, email: true, firstName: true, lastName: true,
-          role: true, avatar: true, membershipNumber: true,
-          phone: true, isActive: true, duesPaidUntil: true,
-          occupation: true, createdAt: true,
-        },
-      }),
-      prisma.user.count({ where }),
+    const conditions: any[] = [];
+    if (search) {
+      conditions.push(or(
+        ilike(users.firstName, `%${search}%`),
+        ilike(users.lastName, `%${search}%`),
+        ilike(users.email, `%${search}%`),
+        ilike(users.membershipNumber, `%${search}%`),
+      ));
+    }
+    if (role) conditions.push(eq(users.role, role));
+
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const [rows, countResult] = await Promise.all([
+      db.select(safeUserSelect).from(users).where(where).orderBy(sql`${users.createdAt} desc`).limit(limitNum).offset(offset),
+      db.select({ count: sql<number>`count(*)` }).from(users).where(where),
     ]);
 
-    return res.json({ data: users, total, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({ data: rows, total: Number(countResult[0].count), page: pageNum, limit: limitNum });
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
   }
 });
 
-// GET /users/export — Admin: CSV export
+// GET /users/export — CSV export
 router.get('/export', authenticate, requireBoard, async (req: AuthRequest, res: Response) => {
   try {
-    const users = await prisma.user.findMany({
-      select: {
-        membershipNumber: true, firstName: true, lastName: true,
-        email: true, phone: true, role: true, duesPaidUntil: true,
-        isActive: true, createdAt: true,
-      },
-      orderBy: { membershipNumber: 'asc' },
-    });
+    const rows = await db.select({
+      membershipNumber: users.membershipNumber, firstName: users.firstName, lastName: users.lastName,
+      email: users.email, phone: users.phone, role: users.role,
+      duesPaidUntil: users.duesPaidUntil, isActive: users.isActive, createdAt: users.createdAt,
+    }).from(users).orderBy(users.membershipNumber);
 
-    const headers = ['N° Membre', 'Prénom', 'Nom', 'Email', 'Téléphone', 'Rôle', 'Cotisation jusqu\'au', 'Actif', 'Inscrit le'];
-    const rows = users.map((u) => [
-      u.membershipNumber || '',
-      u.firstName,
-      u.lastName,
-      u.email,
-      u.phone || '',
-      u.role,
+    const headers = ['N° Membre', 'Prénom', 'Nom', 'Email', 'Téléphone', 'Rôle', "Cotisation jusqu'au", 'Actif', 'Inscrit le'];
+    const csvRows = rows.map((u) => [
+      u.membershipNumber || '', u.firstName, u.lastName, u.email, u.phone || '', u.role,
       u.duesPaidUntil ? new Date(u.duesPaidUntil).toLocaleDateString('fr-FR') : '',
       u.isActive ? 'Oui' : 'Non',
       new Date(u.createdAt).toLocaleDateString('fr-FR'),
     ]);
 
-    const csv = [headers, ...rows].map((r) => r.join(',')).join('\n');
+    const csv = [headers, ...csvRows].map((r) => r.join(',')).join('\n');
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename=membres.csv');
-    return res.send('\uFEFF' + csv); // BOM for Excel
+    return res.send('\uFEFF' + csv);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
   }
@@ -84,41 +80,37 @@ router.get('/export', authenticate, requireBoard, async (req: AuthRequest, res: 
 router.get('/directory', authenticate, requireMember, async (req: AuthRequest, res: Response) => {
   try {
     const { search } = req.query as any;
-    const where: any = { isActive: true, role: { in: ['admin', 'board_member', 'club_member'] } };
+    const conditions: any[] = [
+      eq(users.isActive, true),
+      inArray(users.role, ['admin', 'board_member', 'club_member']),
+    ];
     if (search) {
-      where.OR = [
-        { firstName: { contains: search } },
-        { lastName: { contains: search } },
-        { occupation: { contains: search } },
-      ];
+      conditions.push(or(
+        ilike(users.firstName, `%${search}%`),
+        ilike(users.lastName, `%${search}%`),
+        ilike(users.occupation, `%${search}%`),
+      ));
     }
-    const users = await prisma.user.findMany({
-      where,
-      select: {
-        id: true, firstName: true, lastName: true, avatar: true,
-        role: true, occupation: true, phone: true, email: true,
-        membershipNumber: true,
-      },
-      orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
-    });
-    return res.json(users);
+    const rows = await db.select({
+      id: users.id, firstName: users.firstName, lastName: users.lastName,
+      avatar: users.avatar, role: users.role, occupation: users.occupation,
+      phone: users.phone, email: users.email, membershipNumber: users.membershipNumber,
+    }).from(users).where(and(...conditions)).orderBy(users.lastName, users.firstName);
+    return res.json(rows);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
   }
 });
 
-// GET /users/profile — Get own profile (alias)
+// GET /users/profile — Get own profile
 router.get('/profile', authenticate, async (req: AuthRequest, res: Response) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user!.id },
-      select: {
-        id: true, email: true, firstName: true, lastName: true,
-        role: true, avatar: true, membershipNumber: true,
-        phone: true, bio: true, address: true, occupation: true,
-        duesPaidUntil: true, isActive: true, createdAt: true,
-      },
-    });
+    const [user] = await db.select({
+      id: users.id, email: users.email, firstName: users.firstName, lastName: users.lastName,
+      role: users.role, avatar: users.avatar, membershipNumber: users.membershipNumber,
+      phone: users.phone, bio: users.bio, address: users.address, occupation: users.occupation,
+      duesPaidUntil: users.duesPaidUntil, isActive: users.isActive, createdAt: users.createdAt,
+    }).from(users).where(eq(users.id, req.user!.id));
     return res.json(user);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -129,15 +121,12 @@ router.get('/profile', authenticate, async (req: AuthRequest, res: Response) => 
 router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
   try {
     const targetId = req.params.id === 'me' ? req.user!.id : req.params.id;
-    const user = await prisma.user.findUnique({
-      where: { id: targetId },
-      select: {
-        id: true, email: true, firstName: true, lastName: true,
-        role: true, avatar: true, membershipNumber: true,
-        phone: true, bio: true, address: true, occupation: true,
-        duesPaidUntil: true, isActive: true, createdAt: true,
-      },
-    });
+    const [user] = await db.select({
+      id: users.id, email: users.email, firstName: users.firstName, lastName: users.lastName,
+      role: users.role, avatar: users.avatar, membershipNumber: users.membershipNumber,
+      phone: users.phone, bio: users.bio, address: users.address, occupation: users.occupation,
+      duesPaidUntil: users.duesPaidUntil, isActive: users.isActive, createdAt: users.createdAt,
+    }).from(users).where(eq(users.id, targetId));
     if (!user) return res.status(404).json({ message: 'User not found' });
     return res.json(user);
   } catch (e) {
@@ -149,15 +138,14 @@ router.get('/:id', authenticate, async (req: AuthRequest, res: Response) => {
 router.put('/profile', authenticate, async (req: AuthRequest, res: Response) => {
   try {
     const { firstName, lastName, phone, bio, address, occupation } = req.body;
-    const user = await prisma.user.update({
-      where: { id: req.user!.id },
-      data: { firstName, lastName, phone, bio, address, occupation },
-      select: {
-        id: true, email: true, firstName: true, lastName: true,
-        role: true, avatar: true, membershipNumber: true,
-        phone: true, bio: true, address: true, occupation: true,
-      },
-    });
+    const [user] = await db.update(users)
+      .set({ firstName, lastName, phone, bio, address, occupation, updatedAt: new Date() })
+      .where(eq(users.id, req.user!.id))
+      .returning({
+        id: users.id, email: users.email, firstName: users.firstName, lastName: users.lastName,
+        role: users.role, avatar: users.avatar, membershipNumber: users.membershipNumber,
+        phone: users.phone, bio: users.bio, address: users.address, occupation: users.occupation,
+      });
     return res.json(user);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -169,19 +157,17 @@ router.patch('/profile/avatar', authenticate, upload.single('avatar'), async (re
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
-    const user = await prisma.user.findUnique({ where: { id: req.user!.id } });
-    // Delete old avatar if exists
+    const [user] = await db.select().from(users).where(eq(users.id, req.user!.id));
     if (user?.avatar) {
       const old = path.join(process.env.UPLOAD_DIR || 'uploads', user.avatar);
       if (fs.existsSync(old)) fs.unlinkSync(old);
     }
 
     const avatarPath = `avatars/${req.file.filename}`;
-    const updated = await prisma.user.update({
-      where: { id: req.user!.id },
-      data: { avatar: avatarPath },
-      select: { id: true, avatar: true },
-    });
+    const [updated] = await db.update(users)
+      .set({ avatar: avatarPath, updatedAt: new Date() })
+      .where(eq(users.id, req.user!.id))
+      .returning({ id: users.id, avatar: users.avatar });
     return res.json(updated);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -195,27 +181,26 @@ router.patch('/:id/promote', authenticate, requireAdmin, async (req: AuthRequest
     const validRoles = ['admin', 'board_member', 'club_member', 'normal_user'];
     if (!validRoles.includes(role)) return res.status(400).json({ message: 'Invalid role' });
 
-    // Generate membership number for new members
+    const [targetUser] = await db.select().from(users).where(eq(users.id, req.params.id));
     let membershipNumber: string | undefined;
-    const targetUser = await prisma.user.findUnique({ where: { id: req.params.id } });
     if (!targetUser?.membershipNumber && ['club_member', 'board_member', 'admin'].includes(role)) {
-      const count = await prisma.user.count({ where: { membershipNumber: { not: null } } });
-      membershipNumber = `LC-${String(count + 1).padStart(4, '0')}`;
+      const [{ count }] = await db.select({ count: sql<number>`count(*)` }).from(users).where(isNotNull(users.membershipNumber));
+      membershipNumber = `LC-${String(Number(count) + 1).padStart(4, '0')}`;
     }
 
-    const user = await prisma.user.update({
-      where: { id: req.params.id },
-      data: { role, ...(membershipNumber ? { membershipNumber } : {}) },
-      select: { id: true, email: true, firstName: true, lastName: true, role: true, membershipNumber: true },
-    });
+    const [user] = await db.update(users)
+      .set({ role, ...(membershipNumber ? { membershipNumber } : {}), updatedAt: new Date() })
+      .where(eq(users.id, req.params.id))
+      .returning({
+        id: users.id, email: users.email, firstName: users.firstName,
+        lastName: users.lastName, role: users.role, membershipNumber: users.membershipNumber,
+      });
 
-    await prisma.notification.create({
-      data: {
-        userId: req.params.id,
-        title: 'Rôle mis à jour',
-        message: `Votre rôle a été mis à jour : ${role.replace('_', ' ')}.`,
-        type: 'info',
-      },
+    await db.insert(notifications).values({
+      id: uuid(), userId: req.params.id,
+      title: 'Rôle mis à jour',
+      message: `Votre rôle a été mis à jour : ${role.replace('_', ' ')}.`,
+      type: 'info',
     });
 
     return res.json(user);
@@ -228,11 +213,10 @@ router.patch('/:id/promote', authenticate, requireAdmin, async (req: AuthRequest
 router.patch('/:id/dues', authenticate, requireBoard, async (req: AuthRequest, res: Response) => {
   try {
     const { duesPaidUntil } = req.body;
-    const user = await prisma.user.update({
-      where: { id: req.params.id },
-      data: { duesPaidUntil: duesPaidUntil ? new Date(duesPaidUntil) : null },
-      select: { id: true, duesPaidUntil: true },
-    });
+    const [user] = await db.update(users)
+      .set({ duesPaidUntil: duesPaidUntil ? new Date(duesPaidUntil) : null, updatedAt: new Date() })
+      .where(eq(users.id, req.params.id))
+      .returning({ id: users.id, duesPaidUntil: users.duesPaidUntil });
     return res.json(user);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -243,11 +227,10 @@ router.patch('/:id/dues', authenticate, requireBoard, async (req: AuthRequest, r
 router.patch('/:id/deactivate', authenticate, requireAdmin, async (req: AuthRequest, res: Response) => {
   try {
     const { isActive } = req.body;
-    const user = await prisma.user.update({
-      where: { id: req.params.id },
-      data: { isActive },
-      select: { id: true, isActive: true, firstName: true, lastName: true },
-    });
+    const [user] = await db.update(users)
+      .set({ isActive, updatedAt: new Date() })
+      .where(eq(users.id, req.params.id))
+      .returning({ id: users.id, isActive: users.isActive, firstName: users.firstName, lastName: users.lastName });
     return res.json(user);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });

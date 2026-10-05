@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import prisma from '../prisma';
+import { eq } from 'drizzle-orm';
+import db from '../db';
+import { users } from '../db/schema';
 
 export interface AuthRequest extends Request {
   user?: {
@@ -19,7 +21,7 @@ export const authenticate = async (req: AuthRequest, res: Response, next: NextFu
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET!) as any;
-    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+    const [user] = await db.select().from(users).where(eq(users.id, decoded.id));
     if (!user || !user.isActive) {
       return res.status(401).json({ message: 'User not found or inactive' });
     }

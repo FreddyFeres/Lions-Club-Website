@@ -1,5 +1,8 @@
 import { Router, Response } from 'express';
-import prisma from '../prisma';
+import { eq, and, sql } from 'drizzle-orm';
+import { v4 as uuid } from 'uuid';
+import db from '../db';
+import { notifications } from '../db/schema';
 import { authenticate, AuthRequest } from '../middleware/auth';
 
 const router = Router();
@@ -8,22 +11,29 @@ const router = Router();
 router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
   try {
     const { unread, page = '1', limit = '20' } = req.query as any;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const where: any = { userId: req.user!.id };
-    if (unread === 'true') where.isRead = false;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
 
-    const [notifications, total, unreadCount] = await Promise.all([
-      prisma.notification.findMany({
-        where,
-        skip,
-        take: parseInt(limit),
-        orderBy: { createdAt: 'desc' },
-      }),
-      prisma.notification.count({ where }),
-      prisma.notification.count({ where: { userId: req.user!.id, isRead: false } }),
+    const conditions: any[] = [eq(notifications.userId, req.user!.id)];
+    if (unread === 'true') conditions.push(eq(notifications.isRead, false));
+    const where = and(...conditions);
+
+    const [rows, countResult, unreadResult] = await Promise.all([
+      db.select().from(notifications).where(where)
+        .orderBy(sql`${notifications.createdAt} desc`).limit(limitNum).offset(offset),
+      db.select({ count: sql<number>`count(*)` }).from(notifications).where(where),
+      db.select({ count: sql<number>`count(*)` }).from(notifications)
+        .where(and(eq(notifications.userId, req.user!.id), eq(notifications.isRead, false))),
     ]);
 
-    return res.json({ data: notifications, total, unreadCount, page: parseInt(page), limit: parseInt(limit) });
+    return res.json({
+      data: rows,
+      total: Number(countResult[0].count),
+      unreadCount: Number(unreadResult[0].count),
+      page: pageNum,
+      limit: limitNum,
+    });
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
   }
@@ -32,14 +42,12 @@ router.get('/', authenticate, async (req: AuthRequest, res: Response) => {
 // PATCH /notifications/:id/read — Mark as read
 router.patch('/:id/read', authenticate, async (req: AuthRequest, res: Response) => {
   try {
-    const notification = await prisma.notification.findUnique({ where: { id: req.params.id } });
+    const [notification] = await db.select().from(notifications).where(eq(notifications.id, req.params.id));
     if (!notification || notification.userId !== req.user!.id) {
       return res.status(404).json({ message: 'Notification not found' });
     }
-    const updated = await prisma.notification.update({
-      where: { id: req.params.id },
-      data: { isRead: true },
-    });
+    const [updated] = await db.update(notifications).set({ isRead: true })
+      .where(eq(notifications.id, req.params.id)).returning();
     return res.json(updated);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -49,10 +57,8 @@ router.patch('/:id/read', authenticate, async (req: AuthRequest, res: Response) 
 // PATCH /notifications/read-all — Mark all as read
 router.patch('/read-all', authenticate, async (req: AuthRequest, res: Response) => {
   try {
-    await prisma.notification.updateMany({
-      where: { userId: req.user!.id, isRead: false },
-      data: { isRead: true },
-    });
+    await db.update(notifications).set({ isRead: true })
+      .where(and(eq(notifications.userId, req.user!.id), eq(notifications.isRead, false)));
     return res.json({ message: 'All notifications marked as read' });
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -62,11 +68,11 @@ router.patch('/read-all', authenticate, async (req: AuthRequest, res: Response) 
 // DELETE /notifications/:id — Delete notification
 router.delete('/:id', authenticate, async (req: AuthRequest, res: Response) => {
   try {
-    const notification = await prisma.notification.findUnique({ where: { id: req.params.id } });
+    const [notification] = await db.select().from(notifications).where(eq(notifications.id, req.params.id));
     if (!notification || notification.userId !== req.user!.id) {
       return res.status(404).json({ message: 'Notification not found' });
     }
-    await prisma.notification.delete({ where: { id: req.params.id } });
+    await db.delete(notifications).where(eq(notifications.id, req.params.id));
     return res.json({ message: 'Notification deleted' });
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });

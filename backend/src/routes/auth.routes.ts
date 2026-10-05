@@ -1,7 +1,10 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import prisma from '../prisma';
+import { v4 as uuid } from 'uuid';
+import { eq } from 'drizzle-orm';
+import db from '../db';
+import { users, refreshTokens, notifications } from '../db/schema';
 import { authenticate, AuthRequest } from '../middleware/auth';
 
 const router = Router();
@@ -23,26 +26,25 @@ router.post('/register', async (req: Request, res: Response) => {
     if (!email || !password || !firstName || !lastName) {
       return res.status(400).json({ message: 'All fields are required' });
     }
-    const existing = await prisma.user.findUnique({ where: { email } });
+
+    const [existing] = await db.select().from(users).where(eq(users.email, email));
     if (existing) return res.status(409).json({ message: 'Email already registered' });
 
     const hashed = await bcrypt.hash(password, 12);
-    const user = await prisma.user.create({
-      data: { email, password: hashed, firstName, lastName, phone, role: 'normal_user' },
-    });
+    const id = uuid();
+    const [user] = await db.insert(users).values({
+      id, email, password: hashed, firstName, lastName, phone: phone || null, role: 'normal_user',
+    }).returning();
 
     const { accessToken, refreshToken } = signTokens(user.id);
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    await prisma.refreshToken.create({ data: { token: refreshToken, userId: user.id, expiresAt } });
+    await db.insert(refreshTokens).values({ id: uuid(), token: refreshToken, userId: user.id, expiresAt });
 
-    // Welcome notification
-    await prisma.notification.create({
-      data: {
-        userId: user.id,
-        title: 'Bienvenue !',
-        message: `Bienvenue ${firstName} ! Votre compte a été créé avec succès.`,
-        type: 'success',
-      },
+    await db.insert(notifications).values({
+      id: uuid(), userId: user.id,
+      title: 'Bienvenue !',
+      message: `Bienvenue ${firstName} ! Votre compte a été créé avec succès.`,
+      type: 'success',
     });
 
     const { password: _, ...safeUser } = user;
@@ -59,7 +61,7 @@ router.post('/login', async (req: Request, res: Response) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    const [user] = await db.select().from(users).where(eq(users.email, email));
     if (!user || !user.isActive) return res.status(401).json({ message: 'Invalid credentials' });
 
     const valid = await bcrypt.compare(password, user.password);
@@ -67,7 +69,7 @@ router.post('/login', async (req: Request, res: Response) => {
 
     const { accessToken, refreshToken } = signTokens(user.id);
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    await prisma.refreshToken.create({ data: { token: refreshToken, userId: user.id, expiresAt } });
+    await db.insert(refreshTokens).values({ id: uuid(), token: refreshToken, userId: user.id, expiresAt });
 
     const { password: _, ...safeUser } = user;
     return res.json({ user: safeUser, accessToken, refreshToken });
@@ -83,7 +85,7 @@ router.post('/refresh', async (req: Request, res: Response) => {
     const { refreshToken } = req.body;
     if (!refreshToken) return res.status(400).json({ message: 'Refresh token required' });
 
-    const stored = await prisma.refreshToken.findUnique({ where: { token: refreshToken } });
+    const [stored] = await db.select().from(refreshTokens).where(eq(refreshTokens.token, refreshToken));
     if (!stored || stored.expiresAt < new Date()) {
       return res.status(401).json({ message: 'Invalid or expired refresh token' });
     }
@@ -91,10 +93,9 @@ router.post('/refresh', async (req: Request, res: Response) => {
     const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!) as any;
     const tokens = signTokens(decoded.id);
 
-    // Rotate refresh token
-    await prisma.refreshToken.delete({ where: { token: refreshToken } });
+    await db.delete(refreshTokens).where(eq(refreshTokens.token, refreshToken));
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    await prisma.refreshToken.create({ data: { token: tokens.refreshToken, userId: decoded.id, expiresAt } });
+    await db.insert(refreshTokens).values({ id: uuid(), token: tokens.refreshToken, userId: decoded.id, expiresAt });
 
     return res.json(tokens);
   } catch (e) {
@@ -105,15 +106,12 @@ router.post('/refresh', async (req: Request, res: Response) => {
 // GET /auth/me
 router.get('/me', authenticate, async (req: AuthRequest, res: Response) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user!.id },
-      select: {
-        id: true, email: true, firstName: true, lastName: true,
-        role: true, avatar: true, membershipNumber: true,
-        phone: true, bio: true, address: true, occupation: true,
-        duesPaidUntil: true, isActive: true, createdAt: true,
-      },
-    });
+    const [user] = await db.select({
+      id: users.id, email: users.email, firstName: users.firstName, lastName: users.lastName,
+      role: users.role, avatar: users.avatar, membershipNumber: users.membershipNumber,
+      phone: users.phone, bio: users.bio, address: users.address, occupation: users.occupation,
+      duesPaidUntil: users.duesPaidUntil, isActive: users.isActive, createdAt: users.createdAt,
+    }).from(users).where(eq(users.id, req.user!.id));
     return res.json(user);
   } catch (e) {
     return res.status(500).json({ message: 'Server error' });
@@ -125,7 +123,7 @@ router.post('/logout', authenticate, async (req: AuthRequest, res: Response) => 
   try {
     const { refreshToken } = req.body;
     if (refreshToken) {
-      await prisma.refreshToken.deleteMany({ where: { token: refreshToken } });
+      await db.delete(refreshTokens).where(eq(refreshTokens.token, refreshToken));
     }
     return res.json({ message: 'Logged out successfully' });
   } catch {
